@@ -1,0 +1,1 @@
+obj/MRG_ref.o: src/util/rng/MRG_ref.cpp src/util/rng/MRG.h

@@ -1,0 +1,630 @@
+/*
+ * mcmc_kernel_mv.cu
+ *
+ *  Created on: 24-Feb-2009
+ *      Author: alee
+ */
+
+#include "temper.ch"
+#include "matrix.ch"
+#include "matrix.h"
+#include <stdio.h>
+#include "sharedmem.cuh"
+#include "test_functions.h"
+#include "rng.h"
+
+__constant__ float args_p[NUM_AP];
+//__constant__ int lik_per_thread[2];
+
+template<int D>
+__global__ void FUNC( metropolis_rw_gpu, TYPE)(int N, float* d_array_init, float* d_array_step,
+        float* d_array_uniform, float* d_array_out, int log) {
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int nt = blockDim.x * gridDim.x;
+    int j;
+    float* x;
+    float* w;
+    float ratio;
+    SharedMemory<float> smem;
+    float* sdata = smem.getPointer();
+    float* y = sdata + D * threadIdx.x;
+
+    x = d_vector_get(d_array_init, D, tid);
+
+    for (j = tid; j < N; j += nt) {
+        w = d_vector_get(d_array_step, D, j);
+        d_vector_add(x, w, y, D);
+        // Metropolis so q(y,x) = q(x,y)
+        if (log == 0) {
+            ratio = TARGET<D> (y, args_p) / TARGET<D> (x, args_p);
+        } else {
+            ratio = expf(LOG_TARGET<D> (y, args_p) - LOG_TARGET<D> (x, args_p));
+        }
+        if (d_array_uniform[j] < ratio) {
+            d_vector_set(x, y, D);
+        }
+        d_vector_set(d_vector_get(d_array_out, D, j), x, D);
+    }
+}
+
+template <int D>
+void FUNC( metropolis_rw, TYPE)(int N, float* d_array_init, float sigma, float* d_array_out,
+        float* h_args_p, int log, int nb, int nt) {
+    cudaMemcpyToSymbol(args_p, h_args_p, NUM_AP * sizeof(float));
+
+    float* d_array_uniform;
+    cudaMalloc((void **) &d_array_uniform, N * sizeof(float));
+    populate_rand_d(d_array_uniform, N);
+
+    float* d_array_step;
+    cudaMalloc((void **) &d_array_step, N * D * sizeof(float));
+    populate_randn_d(d_array_step, N * D);
+    if (sigma != 1.0) {
+        multiply(N * D, d_array_step, d_array_step, sigma, nb, nt);
+    }
+
+    FUNC(metropolis_rw_gpu, TYPE) < D> <<<nb,nt,D*nt*sizeof(float)>>>(N, d_array_init, d_array_step, d_array_uniform, d_array_out, log);
+
+    cudaFree(d_array_uniform);
+    cudaFree(d_array_step);
+}
+
+template <int D, int reduction_size>
+__global__ void FUNC( metropolis_rwpop_step, TYPE)(float* d_array_init, float* d_array_step,
+        float* d_array_uniform, float* d_temps, float* d_array_out, int log) {
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    float* w;
+    float* x;
+    float t, ratio;
+    SharedMemory<float> smem;
+    float* sdata = smem.getPointer();
+    float* y = sdata + D * threadIdx.x;
+
+    t = d_temps[tid];
+    x = d_vector_get(d_array_init, D, tid);
+    w = d_vector_get(d_array_step, D, tid);
+    d_vector_add(x, w, y, D);
+
+    // Metropolis so q(y,x) = q(x,y)
+    if (log == 0) {
+        ratio = temper(TARGET<D> (y, args_p), t) / temper(TARGET<D> (x, args_p), t);
+    } else {
+        ratio = expf(LOG_TARGET<D> (y, args_p) * t - LOG_TARGET<D> (x, args_p) * t);
+    }
+    if (d_array_uniform[tid] < ratio) {
+        d_vector_set(d_vector_get(d_array_out, D, tid), y, D);
+    } else {
+        d_vector_set(d_vector_get(d_array_out, D, tid), x, D);
+    }
+}
+
+template <int D, int reduction_size>
+__global__ void FUNC( metropolis_rwpop_step2, TYPE)(float* d_array_init, float* d_array_step,
+        float* d_array_uniform, float* d_temps, float* d_array_out, int log, float* densities, float* d_args_p) {
+   
+     
+    //int lpt=10;//*lik_per_thread;
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    unsigned int nbr_data=(int)args_p[0];
+    //unsigned int lpt=(int)args_p[nbr_data+5];
+    //unsigned int nl = nbr_data/lpt;
+	SharedMemory<float> smem;
+	unsigned int chain_index, data_index;
+	float* log_densities_shared;
+	float* y;
+	float* args_shared;
+if (nbr_data<=8192){
+    chain_index= tid / reduction_size;
+    data_index = tid % reduction_size;    
+    //unsigned int ind = threadIdx.x;
+
+    //unsigned int ceil=1;
+    //unsigned int extra=0;
+    //do{
+    //	ceil *= 2;
+    //} while (ceil<(nbr_data/lpt));
+    //extra=ceil-(nbr_data/lpt);    
+    log_densities_shared = smem.getPointer();
+    y = log_densities_shared + blockDim.x +  D * ( threadIdx.x / reduction_size );
+}
+else{
+    chain_index= tid / (reduction_size/(nbr_data/2048));
+    data_index = tid % (reduction_size/(nbr_data/2048));
+    //unsigned int ind = threadIdx.x;
+
+    //unsigned int ceil=1;
+    //unsigned int extra=0;
+    //do{
+    //	ceil *= 2;
+    //} while (ceil<(nbr_data/lpt));
+    //extra=ceil-(nbr_data/lpt);
+
+    log_densities_shared = smem.getPointer();
+    y = log_densities_shared + blockDim.x +  D * ( threadIdx.x / (reduction_size/(nbr_data/2048)) );
+    args_shared = log_densities_shared + blockDim.x +  D * ( blockDim.x / (reduction_size/(nbr_data/2048)) );
+}
+ 
+
+/////////////////////////
+//shared memory for data 
+    
+
+  // for (int k=threadIdx.x;k<nbr_data+6;k=k+blockDim.x)
+   //     args_shared[k] = d_args_p[k];
+
+//__syncthreads();   
+////////////////////////   
+ 
+    float* w;
+    float* x;
+    float t, ratio;
+
+    if ( data_index == 0 ){	    
+	    t = d_temps[chain_index];
+	    x = d_vector_get(d_array_init, D, chain_index);
+	    w = d_vector_get(d_array_step, D, chain_index);
+	    d_vector_add(x, w, y, D);
+	    //for (int a=(ind+nbr_data/lpt+extra*(ind/(nbr_data/lpt)));a<(ind+nbr_data/lpt+extra*(ind/(nbr_data/lpt))+extra);a++){
+	    	//log_densities_shared[a]=0.0;
+	    //}
+    }
+
+    __syncthreads();   
+    
+    float mySum;
+    if (nbr_data<=8192){
+    	mySum = LOG_TARGET<D> (y, args_p);
+	log_densities_shared[threadIdx.x]=mySum;
+    }
+    else{
+	if (threadIdx.x==0){
+		args_shared[0] = 2048;
+		args_shared[2049] = d_args_p[nbr_data+1];
+		args_shared[2050] = d_args_p[nbr_data+2];
+		args_shared[2051] = d_args_p[nbr_data+3];
+		args_shared[2052] = d_args_p[nbr_data+4];
+		args_shared[2053] = d_args_p[nbr_data+5];
+			
+	}
+	log_densities_shared[threadIdx.x]=0;
+	__syncthreads(); 
+	for (int loads=0;loads<nbr_data/2048;loads++){
+		for (int k=threadIdx.x;k<2048;k=k+blockDim.x){
+			args_shared[k+1] = d_args_p[loads*2048+k+1];
+		}
+		
+		__syncthreads();  
+		mySum = LOG_TARGET<D> (y, args_shared);
+		log_densities_shared[threadIdx.x]+=mySum;
+	}
+	mySum=log_densities_shared[threadIdx.x];
+	//mySum = LOG_TARGET<D> (y, d_args_p);
+	//log_densities_shared[threadIdx.x]=mySum;
+    }    //mySum = LOG_TARGET<D> (y, args_shared); //shared memory for data
+    
+    __syncthreads();
+
+if (nbr_data<=8192){
+    // do reduction in shared mem - completely unrolled
+    if (reduction_size >= 512)
+    {
+        if (data_index < 256)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 256];
+        }
+
+        __syncthreads();
+    }
+
+    if (reduction_size >= 256)
+    {
+        if (data_index < 128)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 128];
+        }
+
+        __syncthreads();
+    }
+
+    if (reduction_size >= 128)
+    {
+        if (data_index <  64)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 64];
+        }
+
+        __syncthreads();
+    }
+
+    if (data_index < 32)
+    {
+        // now that we are using warp-synchronous programming (below)
+        // we need to declare our shared memory volatile so that the compiler
+        // doesn't reorder stores to it and induce incorrect behavior.
+        volatile float *smem = log_densities_shared;
+
+        if (reduction_size >=  64)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x + 32];
+        }
+
+        if (reduction_size >=  32)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x + 16];
+        }
+
+        if (reduction_size >=  16)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  8];
+        }
+
+        if (reduction_size >=   8)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  4];
+        }
+
+        if (reduction_size >=   4)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  2];
+        }
+
+        if (reduction_size >=   2)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  1];
+        }
+    }
+}
+
+else{
+    // do reduction in shared mem - completely unrolled
+    if ( (reduction_size/(nbr_data/2048)) >= 512)
+    {
+        if (data_index < 256)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 256];
+        }
+
+        __syncthreads();
+    }
+
+    if ((reduction_size/(nbr_data/2048)) >= 256)
+    {
+        if (data_index < 128)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 128];
+        }
+
+        __syncthreads();
+    }
+
+    if ((reduction_size/(nbr_data/2048)) >= 128)
+    {
+        if (data_index <  64)
+        {
+            log_densities_shared[threadIdx.x] = mySum = mySum + log_densities_shared[threadIdx.x + 64];
+        }
+
+        __syncthreads();
+    }
+
+    if (data_index < 32)
+    {
+        // now that we are using warp-synchronous programming (below)
+        // we need to declare our shared memory volatile so that the compiler
+        // doesn't reorder stores to it and induce incorrect behavior.
+        volatile float *smem = log_densities_shared;
+
+        if ((reduction_size/(nbr_data/2048)) >=  64)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x + 32];
+        }
+
+        if ((reduction_size/(nbr_data/2048)) >=  32)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x + 16];
+        }
+
+        if ((reduction_size/(nbr_data/2048)) >=  16)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  8];
+        }
+
+        if ((reduction_size/(nbr_data/2048)) >=   8)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  4];
+        }
+
+        if ((reduction_size/(nbr_data/2048)) >=   4)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  2];
+        }
+
+        if ((reduction_size/(nbr_data/2048)) >=   2)
+        {
+            smem[threadIdx.x] = mySum = mySum + smem[threadIdx.x +  1];
+        }
+    }
+
+
+
+}
+ 
+    /*
+    //reduction
+
+    for (unsigned int stride=reduction_size>>1; stride>0; stride >>=1){
+	__syncthreads();
+	if (data_index < stride)
+		log_densities_shared[threadIdx.x] += log_densities_shared[threadIdx.x+stride];	
+    }
+
+   	
+	//reduction
+	for (unsigned int stride=1; stride<ceil; stride*=2){
+		__syncthreads();
+		if (data_index % (2*stride) == 0)
+			log_densities_shared[ind+extra*(ind/(nbr_data/lpt))] += log_densities_shared[ind+extra*(ind/(nbr_data/lpt))+stride];	
+	}
+    */
+
+    
+    //__syncthreads();
+
+    if (data_index == 0){
+                //densities[chain_index]=-200000000000000000000000000.0;
+		//for (int a=threadIdx.x+1;a<(threadIdx.x+(reduction_size/(nbr_data/2048)));a++){
+		//log_densities_shared[threadIdx.x] += log_densities_shared[a];
+		//}
+	    ratio = expf(log_densities_shared[threadIdx.x] * t - densities[chain_index] * t);
+    	    if (d_array_uniform[chain_index] < ratio) {
+		densities[chain_index] = log_densities_shared[threadIdx.x];
+		d_vector_set(d_vector_get(d_array_out, D, chain_index), y, D);
+	    } else {
+		d_vector_set(d_vector_get(d_array_out, D, chain_index), x, D);
+	    }
+    }
+}
+
+template <int D, int reduction_size>
+__global__ void FUNC( metropolis_rwpop_init, TYPE)(float* d_array_init, int log, float* densities) {
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    float* x = d_vector_get(d_array_init, D, tid);
+    if (log == 0) {
+        densities[tid] = TARGET<D> (x, args_p);
+    } else {
+        densities[tid] =  -100000000000.0;//LOG_TARGET<D> (x, args_p);
+    }
+}
+
+template<int D, int reduction_size>
+__global__ void FUNC( metropolis_rwpop_exchange, TYPE)(float* d_array_values, int type, float* d_temps,
+        float* d_array_uniform, int log) {
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int tt = blockDim.x * gridDim.x;
+
+    //	if ((type == 1 && tid % 2 == 0) || (type == 0 && tid % 2 == 1)) {
+    if (tid % 2 == type) {
+
+        int otid = (tid + 1) % tt;
+
+        float* x = d_vector_get(d_array_values, D, tid);
+        float* y = d_vector_get(d_array_values, D, otid);
+
+        float t = d_temps[tid];
+        float t2 = d_temps[otid];
+
+        float ratio;
+        if (log) {
+            float ty = LOG_TARGET<D> (y, args_p);
+            float tx = LOG_TARGET<D> (x, args_p);
+            ratio = expf(ty * (t - t2) + tx * (t2 - t));
+        } else {
+            ratio = temper(TARGET<D> (y, args_p), t) / temper(TARGET<D> (y, args_p), t2) * temper(
+                                TARGET<D> (x, args_p), t2) / temper(TARGET<D> (x, args_p), t);
+        }
+
+        if (d_array_uniform[tid] < ratio) {
+            d_vector_swap(x, y, D);
+        }
+    }
+}
+
+template<int D, int reduction_size>
+__global__ void FUNC( metropolis_rwpop_exchange2, TYPE)(float* d_array_values, int type, float* d_temps,
+        float* d_array_uniform, int log, float* densities) {
+    const int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    const int tt = blockDim.x * gridDim.x;
+
+    //  if ((type == 1 && tid % 2 == 0) || (type == 0 && tid % 2 == 1)) {
+    if (tid % 2 == type) {
+
+        int otid = (tid + 1) % tt;
+
+        float* x = d_vector_get(d_array_values, D, tid);
+        float* y = d_vector_get(d_array_values, D, otid);
+
+        float t = d_temps[tid];
+        float t2 = d_temps[otid];
+
+        float ratio;
+        float ty = densities[otid];
+        float tx = densities[tid];
+        if (log) {
+            ratio = expf(ty * (t - t2) + tx * (t2 - t));
+        } else {
+            ratio = temper(ty, t - t2) * temper(tx, t2 - t);
+        }
+
+        if (d_array_uniform[tid] < ratio) {
+            densities[tid] = ty;
+            densities[otid] = tx;
+            d_vector_swap(x, y, D);
+        }
+    }
+}
+
+template<int D, int reduction_size>
+void FUNC( metropolis_rwpop, TYPE)(int N, float* d_array_init, float sigma, float* h_args_p,
+        float* d_temps, float* d_array_out, int log, int nb, int nt) {
+    cudaMemcpyToSymbol(args_p, h_args_p, NUM_AP * sizeof(float));
+
+    int tt = nb * nt;
+    int numSteps = N / tt;
+
+    int* array_types = (int*) malloc(numSteps * sizeof(int));
+
+    populate_randIK(array_types, numSteps, 2);
+
+    float* d_array_step;
+    cudaMalloc((void **) &d_array_step, N * D * sizeof(float));
+
+    populate_randn_d(d_array_step, N * D);
+
+    if (sigma != 1.0) {
+        multiply(N * D, d_array_step, d_array_step, sigma, nb, nt);
+    }
+
+    float* d_array_uniform1;
+    float* d_array_uniform2;
+    cudaMalloc((void **) &d_array_uniform1, N * sizeof(float));
+    cudaMalloc((void **) &d_array_uniform2, N * sizeof(float));
+    populate_rand_d(d_array_uniform1, N);
+    populate_rand_d(d_array_uniform2, N);
+
+    float* du1 = d_array_uniform1;
+    float* du2 = d_array_uniform2;
+    float* ds = d_array_step;
+
+    for (int i = 0; i < numSteps; i++) {
+
+        //		printf("on step %d\n", i);
+
+        FUNC(metropolis_rwpop_step, TYPE)<D, 0><<<nb,nt,D*nt*sizeof(float)>>>(d_array_init, ds, du1, d_temps, d_array_out, log);
+        cudaThreadSynchronize();
+
+        FUNC(metropolis_rwpop_exchange, TYPE)<D, 0><<<nb,nt>>>(d_array_out, array_types[i], d_temps, du2, log);
+        cudaThreadSynchronize();
+
+        d_array_init = d_array_out;
+        ds += tt * D;
+        du1 += tt;
+        d_array_out += tt * D;
+        du2 += tt;
+
+    }
+
+    cudaFree(d_array_uniform1);
+    cudaFree(d_array_uniform2);
+    cudaFree(d_array_step);
+
+    free(array_types);
+
+}
+
+template<int D, int reduction_size>
+void FUNC( metropolis_rwpop_marginal, TYPE)(int N, float* d_array_init, float sigma, float* h_args_p,
+        float* d_temps, float* d_array_out, int log, int nb, int nt) {
+
+int nbr_data=(int)h_args_p[0];
+//int internal=(int)h_args_p[nbr_data+5];
+//int red=nbr_data/internal;
+//int ceil=1;
+//int extra=0;
+//do{
+//	ceil *= 2;
+//} while (ceil<(nbr_data/internal));
+
+//extra=ceil-nbr_data/internal;
+//printf("\nceil: %d  extra: %d\n", ceil, extra);
+float dens[10];
+float samp[4];    
+
+//int local_lpt[2];
+//local_lpt[0]=10;
+//local_lpt[1]=10;
+
+
+    float* d_args_p;
+    cudaMalloc((void **) &d_args_p, (nbr_data+6) * sizeof(float));
+    cudaMemcpy(d_args_p, h_args_p, (nbr_data+6) * sizeof(float), cudaMemcpyHostToDevice);
+if (nbr_data<=8192){
+    cudaMemcpyToSymbol(args_p, h_args_p, (nbr_data+6) * sizeof(float));
+}
+else{
+    cudaMemcpyToSymbol(args_p, h_args_p, (8192+6) * sizeof(float));
+}    
+//cudaMemcpyToSymbol(lik_per_thread, local_lpt, 2*sizeof(int));
+    int tt = nb * nt;
+    int numSteps = N / tt;
+
+    int* array_types = (int*) malloc(numSteps * sizeof(int));
+
+    populate_randIK(array_types, numSteps, 2);
+
+    float* d_array_step;
+    cudaMalloc((void **) &d_array_step, N * D * sizeof(float));
+    populate_randn_d(d_array_step, N * D);
+    if (sigma != 1.0) {
+        multiply(N * D, d_array_step, d_array_step, sigma, nb, nt);
+    }
+    float* d_array_uniform1;
+    float* d_array_uniform2;
+    cudaMalloc((void **) &d_array_uniform1, N * sizeof(float));
+    cudaMalloc((void **) &d_array_uniform2, N * sizeof(float));
+    populate_rand_d(d_array_uniform1, N);
+    populate_rand_d(d_array_uniform2, N);
+
+    float* du1 = d_array_uniform1;
+    float* du2 = d_array_uniform2;
+    float* ds = d_array_step;
+
+    float* d_array_temp;
+    cudaMalloc((void**) &d_array_temp, tt * D * sizeof(float));
+
+    float* densities;
+    cudaMalloc((void**) &densities, tt * sizeof(float));
+
+    FUNC( metropolis_rwpop_init, TYPE)<D, 0><<<nb,nt>>>(d_array_init, log, densities);
+    cudaThreadSynchronize();
+printf("\nfinished init, %d\n",reduction_size);
+//int aaa=nbr_data/lik_per_thread;
+    for (int i = 0; i < numSteps; i++) {
+        //		printf("Time %d:\n", i);
+
+	//FUNC(metropolis_rwpop_step2, TYPE)<D><<<nb,nt*nbr_data,nt*sizeof(float)>>>(d_array_init, ds + i * tt * D, du1 + i * tt, d_temps, d_array_temp, log, densities, nbr_data);
+	
+//printf("%d\n",aaa);        
+
+if (nbr_data<=8192){
+	FUNC(metropolis_rwpop_step2, TYPE)<D,reduction_size><<<nb,nt*reduction_size,(nt*reduction_size+nt*D)*sizeof(float)>>>(d_array_init, ds + i * tt * D, du1 + i * tt, d_temps, d_array_temp, log, densities, d_args_p); 
+}
+else{
+	FUNC(metropolis_rwpop_step2, TYPE)<D,reduction_size><<<nb,(nt*reduction_size)/(nbr_data/2048),((nt*reduction_size)/(nbr_data/2048)+nt*D+2048)*sizeof(float)>>>(d_array_init, ds + i * tt * D, du1 + i * tt, d_temps, d_array_temp, log, densities, d_args_p);
+}
+ 
+//remove nbr_data+6 from kernel arguments to get constant memory data
+
+        cudaThreadSynchronize();
+
+        FUNC(metropolis_rwpop_exchange2, TYPE)<D, 0><<<nb,nt>>>(d_array_temp, array_types[i], d_temps,
+                du2 + i * tt, log, densities);
+
+        cudaMemcpy(d_array_init, d_array_temp, tt * D * sizeof(float), cudaMemcpyDeviceToDevice);
+
+        cudaMemcpy(vector_get(d_array_out, D, i), vector_get(d_array_temp, D, tt - 1), D
+                * sizeof(float), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(dens, densities+tt-4, 4*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(samp, d_array_temp+tt*D-4, 4*sizeof(float), cudaMemcpyDeviceToHost);
+printf("\n\nDensities: %f %f %f %f \n\n", dens[0], dens[1], dens[2], dens[3]);
+printf("\n\nSamples: %f %f %f %f\n\n", samp[0], samp[1], samp[2], samp[3]);
+    }
+
+    cudaFree(d_array_uniform1);
+    cudaFree(d_array_uniform2);
+    cudaFree(d_array_step);
+    cudaFree(d_array_temp);
+    cudaFree(densities);
+
+    free(array_types);
+
+}

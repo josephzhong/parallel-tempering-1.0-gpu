@@ -1,0 +1,2 @@
+obj/xorshift_ref.o: src/util/rng/xorshift_ref.cpp \
+ src/util/rng/rng_shared.h src/util/rng/xorshift.h
